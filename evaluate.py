@@ -21,13 +21,14 @@ from logistic_lda import embeddings, models
 
 import numpy as np
 import tensorflow as tf
-
+tf.compat.v1.enable_eager_execution()
 
 def main(args):
   # prepare training and validation data
   dataset_test, meta_info = create_datasets(max_epochs=args.num_iter, **vars(args))
 
   def get_dataset_iterator():
+    #return tf.compat.v1.data.make_one_shot_iterator(dataset_test).get_next()
     return dataset_test.make_one_shot_iterator().get_next()
 
   embedding = partial(getattr(embeddings, args.embedding), meta_info=meta_info, args=args, mode='valid')
@@ -51,7 +52,8 @@ def main(args):
       },
       warm_start_from=args.model_dir,
     )
-  classifier.train(get_dataset_iterator)
+  classifier.train(
+    input_fn = lambda:tf.compat.v1.data.make_one_shot_iterator(create_datasets(max_epochs=args.num_iter, **vars(args))[0]).get_next())
 
   # infer topics and author's topic distributions
   classifier = tf.estimator.Estimator(
@@ -72,7 +74,8 @@ def main(args):
       },
       model_dir=classifier.model_dir,
     )
-  classifier.train(get_dataset_iterator)
+  classifier.train(
+    input_fn = lambda:tf.compat.v1.data.make_one_shot_iterator(create_datasets(max_epochs=args.num_iter, **vars(args))[0]).get_next())
 
   author_predictions = []
   author_topics = []
@@ -84,7 +87,8 @@ def main(args):
   tweets_per_author = defaultdict(int)
 
   # get labels and predictions
-  for prediction in classifier.predict(get_dataset_iterator):
+  for prediction in classifier.predict(
+    input_fn =  lambda:tf.compat.v1.data.make_one_shot_iterator(create_datasets(max_epochs=args.num_iter, **vars(args))[0]).get_next()):
     author_predictions.append(prediction['author_prediction'])
     author_topics.append(prediction['author_topic'])
     author_ids.append(prediction['author_id'])
@@ -205,7 +209,7 @@ if __name__ == '__main__':
   args_file = os.path.join(args.model_dir, 'args.json')
   args_dict = {}
 
-  if tf.io.gfile.Exists(args_file):
+  if tf.io.gfile.exists(args_file):
     with tf.io.gfile.GFile(args_file, 'r') as handle:
       args_dict = json.load(handle)
 
@@ -223,5 +227,5 @@ if __name__ == '__main__':
         setattr(args, key, args_dict[key])
 
   pprint.pprint(vars(args))
-
+  tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
   sys.exit(main(args))

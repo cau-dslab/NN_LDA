@@ -41,8 +41,8 @@ def main(args):
         model_dir=args.model_dir,
         warm_start_from=args.warm_start_from)
   # train
-    def input_fn():
-        return iter(dataset_train).get_next()
+    #def input_fn():
+    #    return iter(dataset_train).get_next()
 
     # dataset = iter(create_datasets(**vars(args))[0]).get_next()
     # print(dataset)
@@ -114,5 +114,14 @@ if __name__ == '__main__':
     # choices=list(zip(*inspect.getmembers(models, inspect.isfunction)))[0]
     # print(choices)
     #pprint.pprint(vars(args))
+    if args.overwrite and tf.gfile.Exists(args.model_dir):
+    # delete previous checkpoints
+        tf.gfile.DeleteRecursively(args.model_dir)
+
+  # store hyperparameters
+    tf.io.gfile.mkdir(args.model_dir)
+    with tf.io.gfile.GFile(os.path.join(args.model_dir, 'args.json'), 'w') as handle:
+        json.dump(vars(args), handle, indent=4)
+
     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
     main(args)
