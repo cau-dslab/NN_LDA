@@ -10,6 +10,7 @@ from logistic_lda.utils import create_table, softmax_cross_entropy
 
 import numpy as np
 import tensorflow as tf
+#import tensorflow_probability as tfp
 from tensorflow import keras
 from tensorflow.keras import layers
 from logistic_lda.embeddings import one_hot
@@ -59,7 +60,7 @@ def mlp_custom(features, labels, mode, params):
 
      # model is trained to predict which topic an author belongs to
     loss = tf.math.reduce_mean(
-        tf.nn.softmax_cross_entropy_with_logits(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
             labels=tf.one_hot(author_topics, depth=n_topics),
             logits=logits
         )
@@ -146,5 +147,174 @@ def logistic_lda(features, labels, mode, params):
         params['alpha']: Smoothes topic distributions of authors
         params['embedding']: A function which preprocesses features
     """
-    print("models")
-  
+    if params['author_topic_iterations'] < 1:
+        raise ValueError('`author_topic_iterations` should be larger than 0.')
+
+    n_authors = len(params['meta_info']['author_ids'])
+    n_topics = len(params['meta_info']['topics'])
+
+    with tf.name_scope('preprocessing'):
+        # lookup table which maps topics to indices and missing topics to -1
+        topic_table = create_table(
+            keys=params['meta_info']['topics'] + [''],
+            values=list(range(n_topics)) + [-1],
+            name='topic_table')
+
+        # convert string labels to integers
+        author_topics = topic_table.lookup(features['author_topic'])
+        item_topics = topic_table.lookup(features['item_topic'])
+
+        # convert author IDs to low integers
+        author_table = create_table(
+            keys=np.asarray(params['meta_info']['author_ids'], dtype=np.int64),
+            name='author_table')
+        author_ids = tf.squeeze(author_table.lookup(features['author_id']))
+
+    # preprocess features (e.g., compute embeddings from words)
+    with tf.name_scope('embedding'):
+        features = params['embedding'](features)
+
+    # predict topics from items
+    net = features['embedding']
+    for units in params['hidden_units']:
+        net = layers.Dense(units, activation=tf.nn.relu)(net)
+    #여기 까지 함
+    with tf.name_scope('variational_inference'):
+        # keeps track of topic counts per user
+        topic_counts_var = tf.compat.v1.get_variable(
+            'topic_counts',
+            shape=[n_authors, n_topics],
+            dtype=tf.float32,
+            initializer=tf.ones_initializer,
+            trainable=False,
+            use_resource=True)
+
+        # keeps track of predicted topic distributions across all items
+        topic_dist_total_var = tf.compat.v1.get_variable(
+            'topic_dist_total',
+            shape=[1, n_topics],
+            initializer=tf.constant_initializer(1.0 / n_topics),
+            trainable=False,
+            use_resource=True)
+
+        # expected topic counts for each author
+        topic_counts = tf.gather(topic_counts_var, author_ids)
+
+        author_topics_onehot = tf.one_hot(tf.squeeze(author_topics), n_topics)
+        author_topics_prediction = tf.ones_like(author_topics_onehot) / n_topics
+
+        print(author_topics_onehot)
+        print(author_topics_prediction)
+
+        # infer missing author topics
+        for _ in range(params['author_topic_iterations']):
+            #여기 일단 제외한다. broadcasting 안된다는 오류가 계속 뜬다.
+            # if params['use_author_topics']:
+            #     # where available, use ground truth instead of predictions
+            #     author_topics_prediction = tf.where(
+            #         author_topics < 0,
+            #         author_topics_prediction,#author_topic이 0보다 작을 경우 들어가는 tensor
+            #         author_topics_onehot) # author_topic이 0보다 클 경우 들어가는 tensor
+
+            # update beliefs over author's topic distribution
+            author_alpha = params['alpha'] + topic_counts + params['author_topic_weight'] * author_topics_prediction
+            topic_biases = tf.math.digamma(author_alpha)
+
+            # update predictions of author topics
+            author_topics_prediction = tf.nn.softmax(params['author_topic_weight'] * topic_biases)
+
+        logits = layers.Dense(n_topics, activation=None)(net)  # BxK
+        logits_biased = logits + topic_biases
+
+        # probability of each topic
+        probs = tf.nn.softmax(logits)
+        probs_biased = tf.nn.softmax(logits_biased)
+
+        if mode == tf.estimator.ModeKeys.PREDICT:
+            if params['author_topic_weight'] < 1e-8:
+                author_topics_prediction = tf.nn.softmax(1e-8 * topic_biases)
+
+            predictions = {
+                'item_id': features.get('item_id', tf.zeros_like(author_ids) - 1),
+                'item_prediction': tf.argmax(logits_biased, 1),
+                'item_probability': tf.reduce_max(probs_biased, 1),
+                'item_topic': item_topics,
+                'author_id': author_ids,
+                'author_prediction': tf.argmax(author_topics_prediction, 1),
+                'author_probability': tf.reduce_max(author_topics_prediction, 1),
+                'author_topic': author_topics,
+            }
+            return tf.estimator.EstimatorSpec(mode, predictions=predictions)
+
+        # model is regularized to predict these topics
+        expected_topics = (probs + 1e-6) / (topic_dist_total_var + 1e-6) / n_topics
+
+        # the unbiased model tries to predict the biased topics
+        loss = tf.reduce_mean(
+        softmax_cross_entropy(
+            targets=tf.stop_gradient(probs_biased + params['model_regularization'] * expected_topics),
+            logits=logits))
+
+        tf.summary.scalar('cross_entropy', loss)
+
+        # compute upper bound on the KL divergence (up to a constant)
+        with tf.name_scope('upper_bound'):
+            dirichlet_entropy = tf.compat.v1.distributions.Dirichlet(author_alpha).entropy()
+            dirichlet_entropy = tf.reduce_mean(dirichlet_entropy) / params['items_per_author']
+
+            dirichlet_regularizer = (params['alpha'] - 1.0) * tf.reduce_sum(topic_biases, axis=1)
+            dirichlet_regularizer = tf.reduce_mean(dirichlet_regularizer) / params['items_per_author']
+
+            regularizer_entropy = tf.reduce_sum(expected_topics * tf.math.log(expected_topics), axis=1)
+            regularizer_entropy = -tf.reduce_mean(regularizer_entropy) * params['model_regularization']
+
+            logprobs_biased = logits_biased - tf.reduce_logsumexp(logits_biased, axis=1, keepdims=True)
+            topic_entropy_plus = tf.reduce_sum(probs_biased * (logprobs_biased - topic_biases), axis=1)
+            topic_entropy_plus = -tf.reduce_mean(topic_entropy_plus)
+
+            loss = loss - tf.stop_gradient(
+                dirichlet_regularizer + dirichlet_entropy + topic_entropy_plus + regularizer_entropy)
+
+            tf.summary.scalar('upper_bound', loss)
+        
+        if mode == tf.estimator.ModeKeys.EVAL:
+            # this assumes that all authors/items are labeled
+            accuracy_author = tf.metrics.accuracy(
+                labels=author_topics,
+                predictions=tf.argmax(topic_counts, 1),
+                name='acc_op')
+            accuracy_item = tf.metrics.accuracy(
+                labels=item_topics,
+                predictions=tf.argmax(logits_biased, 1),
+                name='acc_op')
+            metric_ops = {
+                'accuracy_author': accuracy_author,
+                'accuracy_item': accuracy_item}
+
+            return tf.estimator.EstimatorSpec(mode, loss=loss, eval_metric_ops=metric_ops)
+
+        # update topic counters
+        topic_counts_diff = probs_biased - topic_counts / params['items_per_author']
+        topic_counts_update = tf.compat.v1.scatter_add(topic_counts_var, author_ids, topic_counts_diff)
+
+        # update distribution of predicted topics
+        topic_dist_diff = (probs - topic_dist_total_var) / (params['items_per_author'] * n_authors)
+        topic_dist_total_update = tf.compat.v1.assign_add(
+            topic_dist_total_var, tf.reduce_sum(topic_dist_diff, axis=0, keepdims=True))
+
+        optimizer = tf.compat.v1.train.AdamOptimizer(
+                learning_rate=tf.compat.v1.train.exponential_decay(
+                learning_rate=params['learning_rate'],
+                decay_rate=params['decay_rate'],
+                decay_steps=params['decay_steps'],
+                global_step=tf.compat.v1.train.get_global_step()))
+        train_op = optimizer.minimize(loss, global_step=tf.compat.v1.train.get_global_step())
+
+        # update model parameters, topic counts, and topic distribution estimate
+        train_op = tf.group(train_op, topic_counts_update, topic_dist_total_update)
+
+
+    return tf.estimator.EstimatorSpec(
+        mode,
+        loss=loss,
+        train_op=train_op)

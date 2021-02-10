@@ -41,25 +41,16 @@ def main(args):
         model_dir=args.model_dir,
         warm_start_from=args.warm_start_from)
   # train
-    #def input_fn():
-    #    return iter(dataset_train).get_next()
 
-    # dataset = iter(create_datasets(**vars(args))[0]).get_next()
-    # print(dataset)
-    strategy = tf.distribute.MirroredStrategy()
-    with strategy.scope():
-        classifier.train(
-            input_fn=lambda: tf.compat.v1.data.make_one_shot_iterator(create_datasets(**vars(args))[0]).get_next(),
-            # input_fn = lambda : input_fn(),
-            max_steps=args.max_steps)
-    # 이 부분 수정해야함
+    classifier.train(
+        input_fn=lambda: tf.compat.v1.data.make_one_shot_iterator(create_datasets(**vars(args))[0]).get_next(),
+        # input_fn = lambda : input_fn(),
+        max_steps=args.max_steps)
   # evaluate
     if args.num_valid > 0:
         classifier.evaluate(lambda: tf.compat.v1.data.make_one_shot_iterator(create_datasets(**vars(args))[1]).get_next())
 
     return 0
-
-
 
 if __name__ == '__main__':
     parser = ArgumentParser(description=__doc__)
@@ -91,7 +82,7 @@ if __name__ == '__main__':
         help='Number of training points used for validation')
     parser.add_argument('--hidden_units', type=int, nargs='*', default=[512, 256, 128],
         help='List of hidden units defining the neural network architecture')
-    parser.add_argument('--model', default='mlp_custom',
+    parser.add_argument('--model', default='logistic_lda',
     # logistic_lda 이전에 mlp 버전 먼저 구현
         choices=list(zip(*inspect.getmembers(models, inspect.isfunction)))[0],
         help='Which model function to use')
